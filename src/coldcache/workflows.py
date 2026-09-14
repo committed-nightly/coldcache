@@ -21,6 +21,8 @@ from typing import Any
 
 import yaml
 
+from .templates import split_lines
+
 WORKFLOW_DIR = ".github/workflows"
 WORKFLOW_SUFFIXES = (".yml", ".yaml")
 
@@ -202,14 +204,18 @@ def _scalar(value: Any) -> str | None:
 
 
 def _lines(value: Any) -> list[str]:
-    """A `restore-keys:` or `path:` value as a list of non-empty lines."""
+    """A `restore-keys:` or `path:` value as a list of non-empty entries.
+
+    Split on the newlines the action would split on, which are not all of
+    them -- see `templates.split_lines`.
+    """
     if isinstance(value, list):
         items = [_scalar(v) for v in value]
         return [i.strip() for i in items if i and i.strip()]
     text = _scalar(value)
     if text is None:
         return []
-    return [line.strip() for line in text.splitlines() if line.strip()]
+    return split_lines(text)
 
 
 def _literal(value: Any) -> str | None:

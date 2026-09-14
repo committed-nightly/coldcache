@@ -148,7 +148,10 @@ def parse(template: str) -> list[Part]:
                 parts.append(Text("".join(buf)))
                 buf = []
             raw = template[i + len(OPEN) : end]
-            parts.append(Expr(canonical(raw), raw.strip()))
+            # An expression may be written across several lines. Keep the
+            # source on one line for printing; `canonical` has already
+            # decided that the whitespace does not matter.
+            parts.append(Expr(canonical(raw), " ".join(raw.split())))
             i = end + len(CLOSE)
         else:
             buf.append(template[i])
@@ -156,6 +159,44 @@ def parse(template: str) -> list[Part]:
     if buf:
         parts.append(Text("".join(buf)))
     return parts
+
+
+def split_lines(text: str) -> list[str]:
+    """Split a multi-line input on the newlines the action would split on.
+
+    `restore-keys` and `path` are newline-separated lists, and the action
+    splits them after GitHub has substituted the expressions -- so a newline
+    that falls *inside* a `${{ ... }}` is whitespace in an expression and not
+    a separator at all. Written out in a `|` block, this is entirely normal:
+
+        restore-keys: |
+          ${{ runner.os }}-${{ runner.arch }}-mypy-${{
+          env.CACHE_VERSION }}-
+
+    That is one restore-key. Splitting on the newline first gives two, both
+    of them nonsense, and a tool that does it reports a real workflow as
+    broken -- which is how this function came to exist.
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text.startswith(OPEN, i):
+            end = _find_close(text, i + len(OPEN))
+            if end is not None:
+                buf.append(text[i : end + len(CLOSE)])
+                i = end + len(CLOSE)
+                continue
+        if text[i] == "\n":
+            out.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(text[i])
+        i += 1
+    out.append("".join(buf))
+    return [line.strip() for line in out if line.strip()]
 
 
 def expressions(parts: list[Part]) -> list[Expr]:

@@ -15,6 +15,7 @@ from coldcache.templates import (
     prefix_match,
     rendered,
     same,
+    split_lines,
 )
 
 
@@ -195,3 +196,24 @@ class TestForms:
 def test_equivalent_spellings_share_an_atom(left, right):
     alphabet = Alphabet()
     assert forms(parse(left), {}, alphabet) == forms(parse(right), {}, alphabet)
+
+
+class TestSplitLines:
+    def test_plain_lines(self):
+        assert split_lines("one-\ntwo-\n") == ["one-", "two-"]
+
+    def test_a_newline_inside_an_expression_is_not_a_separator(self):
+        # home-assistant/core writes a restore-key exactly like this. It is
+        # one key; splitting it first gives three, all of them nonsense.
+        text = (
+            "${{ runner.os }}-${{ runner.arch }}-mypy-${{\n"
+            "env.MYPY_CACHE_VERSION }}-${{\n"
+            "env.HA_SHORT_VERSION }}-\n"
+        )
+        assert len(split_lines(text)) == 1
+
+    def test_blank_lines_go(self):
+        assert split_lines("a\n\n  \nb") == ["a", "b"]
+
+    def test_an_unterminated_expression_still_splits(self):
+        assert split_lines("${{ oops\nb") == ["${{ oops", "b"]

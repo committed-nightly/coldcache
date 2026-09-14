@@ -452,7 +452,8 @@ def check(
                         Undecided(
                             step.path,
                             step.label,
-                            f"restore-key {raw!r} could not be compared with the "
+                            f"restore-key {' '.join(raw.split())!r} could not be "
+                            "compared with the "
                             "keys other steps save",
                         )
                     )
