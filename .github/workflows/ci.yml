@@ -1,0 +1,76 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest
+
+  dogfood:
+    # Run the tool on this repository, for real. This repository caches
+    # nothing, so the interesting half is the second and third steps: proving
+    # it still says so, and proving it does not stay quiet when it should not.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+
+      - name: our own workflows have nothing cold in them
+        run: coldcache
+
+      - name: nothing is left undecided in our own workflows
+        run: |
+          coldcache > report.txt
+          if grep -q '^not checked:' report.txt; then
+            cat report.txt
+            echo "a key in this repository could not be decided"
+            exit 1
+          fi
+
+      # `code=0; cmd || code=$?` rather than `cmd; code=$?`, because these
+      # steps run under `bash -e` and the whole point is to run a command
+      # that exits non-zero.
+      - name: the cache everyone copies wrong is caught
+        run: |
+          cat > .github/workflows/scratch.yml <<'YAML'
+          name: Scratch
+          on: [push]
+          jobs:
+            a:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/cache@v4
+                  with:
+                    path: ~/.cache
+                    key: build-${{ github.run_id }}
+          YAML
+          code=0; coldcache || code=$?
+          rm .github/workflows/scratch.yml
+          test "$code" -eq 1 || { echo "expected exit 1, got $code"; exit 1; }
+
+      - name: a directory with no workflows is an error, not a pass
+        run: |
+          mkdir -p /tmp/empty
+          code=0; coldcache /tmp/empty || code=$?
+          test "$code" -eq 2 || { echo "expected exit 2, got $code"; exit 1; }
