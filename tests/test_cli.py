@@ -41,7 +41,7 @@ BAD = """
 
 @pytest.fixture
 def repo(tmp_path):
-    def go(workflows, files=()):
+    def go(workflows, files=(), cloned_from=None):
         directory = tmp_path / ".github" / "workflows"
         directory.mkdir(parents=True)
         for name, text in workflows.items():
@@ -50,6 +50,11 @@ def repo(tmp_path):
             path = tmp_path / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("x")
+        if cloned_from is not None:
+            # What `git clone` writes: the remote's HEAD, as a symbolic ref.
+            refs = tmp_path / ".git" / "refs" / "remotes" / "origin"
+            refs.mkdir(parents=True)
+            (refs / "HEAD").write_text(f"ref: refs/remotes/origin/{cloned_from}\n")
         return str(tmp_path)
 
     return go
@@ -117,6 +122,19 @@ def test_undecided_is_printed_on_a_green_run(repo, capsys):
     assert "not checked:" in capsys.readouterr().out
 
 
+ON_MASTER = """
+    on:
+      push:
+        branches: [master]
+    jobs:
+      test:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/cache@v4
+            with: {path: x, key: npm-v1}
+"""
+
+
 def test_the_default_branch_can_be_named(repo, capsys):
     workflows = {
         "ci.yml": """
@@ -132,6 +150,48 @@ def test_the_default_branch_can_be_named(repo, capsys):
         """
     }
     assert main([repo(workflows), "--default-branch", "trunk"]) == EXIT_OK
+
+
+def test_the_default_branch_is_read_from_the_clone(repo, capsys):
+    # The rust-analyzer case: `push: branches: [master]` in a repository
+    # whose default branch really is `master`. Assuming `main` made this a
+    # confident false positive.
+    root = repo({"ci.yml": ON_MASTER}, cloned_from="master")
+    assert main([root]) == EXIT_OK
+    assert "never-on-default-branch" not in capsys.readouterr().out
+
+
+def test_a_clone_from_a_main_repository_still_reports_it(repo, capsys):
+    root = repo({"ci.yml": ON_MASTER}, cloned_from="main")
+    assert main([root]) == EXIT_FOUND
+    assert "never-on-default-branch" in capsys.readouterr().out
+
+
+def test_an_explicit_name_beats_the_clone(repo, capsys):
+    root = repo({"ci.yml": ON_MASTER}, cloned_from="master")
+    assert main([root, "--default-branch", "main"]) == EXIT_FOUND
+
+
+def test_no_clone_to_read_declines_rather_than_assuming_main(repo, capsys):
+    root = repo({"ci.yml": ON_MASTER})
+    assert main([root]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "not checked:" in out
+    assert "never-on-default-branch" not in out
+
+
+def test_json_says_which_branch_it_used(repo, capsys):
+    root = repo({"ci.yml": ON_MASTER}, cloned_from="master")
+    main([root, "--json"])
+    assert json.loads(capsys.readouterr().out)["default_branch"] == "master"
+
+
+def test_json_says_so_when_it_had_none(repo, capsys):
+    root = repo({"ci.yml": ON_MASTER})
+    main([root, "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["default_branch"] is None
+    assert len(payload["undecided"]) == 1
 
 
 def test_also_registers_a_drop_in_action(repo):

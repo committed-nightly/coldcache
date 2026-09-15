@@ -25,6 +25,7 @@ import textwrap
 
 from .core import Report, scan
 from .globs import Tree
+from .repo import default_branch
 from .workflows import WORKFLOW_DIR, WORKFLOW_SUFFIXES, WorkflowError, is_workflow_path
 
 EXIT_OK = 0
@@ -49,11 +50,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--default-branch",
-        default="main",
+        default=None,
         metavar="NAME",
         help=(
             "the branch a cache has to be saved on for every other branch to "
-            "read it (default: main)"
+            "read it. Default: whatever refs/remotes/origin/HEAD says. If that "
+            "is not there, nothing is assumed -- the one check that needs the "
+            "name declines the cases that turn on it"
         ),
     )
     parser.add_argument(
@@ -172,11 +175,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"coldcache: cannot read {args.path}: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
+    # An explicit --default-branch is taken at its word. Otherwise ask git,
+    # and if git has not been asked either, carry on without a name rather
+    # than assuming `main`: two of the first three real repositories this was
+    # pointed at were on `master` and `canary`.
+    branch = args.default_branch or default_branch(args.path)
+
     try:
         report = scan(
             files,
             tree=tree,
-            default_branch=args.default_branch,
+            default_branch=branch,
             extra_actions=tuple(args.also),
         )
     except WorkflowError as exc:
@@ -189,6 +198,10 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "workflows": report.workflows,
                     "steps": report.steps,
+                    # null when no name was given and none could be read.
+                    # Anything consuming this needs to be able to tell a
+                    # clean never-on-default-branch from an unasked one.
+                    "default_branch": branch,
                     "findings": [f.as_dict() for f in report.sorted_findings()],
                     "undecided": [
                         {"path": u.path, "where": u.where, "reason": u.reason}
