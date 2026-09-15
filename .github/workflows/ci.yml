@@ -1,0 +1,122 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest
+
+  dogfood:
+    # Run the tool on this repository, for real. This repository caches
+    # nothing, so the interesting half is the second and third steps: proving
+    # it still says so, and proving it does not stay quiet when it should not.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+
+      - name: our own workflows have nothing cold in them
+        run: coldcache
+
+      - name: nothing is left undecided in our own workflows
+        run: |
+          coldcache > report.txt
+          if grep -q '^not checked:' report.txt; then
+            cat report.txt
+            echo "a key in this repository could not be decided"
+            exit 1
+          fi
+
+      # `code=0; cmd || code=$?` rather than `cmd; code=$?`, because these
+      # steps run under `bash -e` and the whole point is to run a command
+      # that exits non-zero.
+      - name: the cache everyone copies wrong is caught
+        # The scratch workflow needs a literal `${{ github.run_id }}` in it,
+        # and GitHub substitutes expressions in a `run:` block before bash
+        # ever sees them -- a quoted heredoc does not help, because the
+        # rewrite happens first. So the `${{` is assembled from a variable
+        # here, and the heredoc delimiter is unquoted so that it expands.
+        run: |
+          OPEN='${''{'
+          cat > .github/workflows/scratch.yml <<YAML
+          name: Scratch
+          on: [push]
+          jobs:
+            a:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/cache@v4
+                  with:
+                    path: ~/.cache
+                    key: build-$OPEN github.run_id }}
+          YAML
+          grep -qF "build-$OPEN github.run_id }}" .github/workflows/scratch.yml \
+            || { cat .github/workflows/scratch.yml; echo "scratch key was rewritten"; exit 1; }
+          code=0; coldcache || code=$?
+          rm .github/workflows/scratch.yml
+          test "$code" -eq 1 || { echo "expected exit 1, got $code"; exit 1; }
+
+      - name: a directory with no workflows is an error, not a pass
+        run: |
+          mkdir -p /tmp/empty
+          code=0; coldcache /tmp/empty || code=$?
+          test "$code" -eq 2 || { echo "expected exit 2, got $code"; exit 1; }
+
+      - name: the default branch is read, not assumed
+        # A repository whose default branch is `master`, saving its cache on
+        # `master`. Assuming `main` called that a finding; reading the clone
+        # does not. The three cases differ only in what origin/HEAD says.
+        run: |
+          mkdir -p /tmp/onmaster/.github/workflows /tmp/onmaster/.git/refs/remotes/origin
+          cat > /tmp/onmaster/.github/workflows/ci.yml <<'YAML'
+          name: CI
+          on:
+            push:
+              branches: [master]
+          jobs:
+            a:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/cache@v4
+                  with: {path: ~/.cache, key: npm-v1}
+          YAML
+
+          HEAD=/tmp/onmaster/.git/refs/remotes/origin/HEAD
+
+          echo 'ref: refs/remotes/origin/master' > $HEAD
+          code=0; coldcache /tmp/onmaster || code=$?
+          test "$code" -eq 0 || { echo "master clone: expected 0, got $code"; exit 1; }
+
+          echo 'ref: refs/remotes/origin/main' > $HEAD
+          code=0; coldcache /tmp/onmaster || code=$?
+          test "$code" -eq 1 || { echo "main clone: expected 1, got $code"; exit 1; }
+
+          # What actions/checkout leaves behind: a sha, not a name. Unknown,
+          # so the check declines rather than falling back to `main` -- and
+          # says so, which is the half worth asserting.
+          echo '0000000000000000000000000000000000000000' > $HEAD
+          code=0; coldcache /tmp/onmaster > /tmp/unknown.txt || code=$?
+          test "$code" -eq 0 || { echo "no name: expected 0, got $code"; exit 1; }
+          grep -q '^not checked:' /tmp/unknown.txt \
+            || { cat /tmp/unknown.txt; echo "declined silently"; exit 1; }
