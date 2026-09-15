@@ -29,12 +29,15 @@ coldcache
 ```
 
 It reads `.github/workflows` off disk, and the rest of the working tree too,
-because `hashFiles()` is a question about which files exist. It never touches
-git, the network or the Actions API.
+because `hashFiles()` is a question about which files exist. The one thing it
+reads outside the tree is `.git/refs/remotes/origin/HEAD`, which is where a
+clone records the remote's default branch — a file, not a `git` subprocess.
+No network, no token, no Actions API.
 
 ```
 --default-branch NAME   the branch a cache must be saved on for other
-                        branches to read it (default: main)
+                        branches to read it. Default: whatever the clone
+                        recorded, and nothing assumed if it recorded nothing
 --also OWNER/REPO       another action taking the same key, restore-keys and
                         path inputs, such as buildjet/cache. Repeatable
 --json                  the same findings, for piping somewhere
@@ -68,9 +71,11 @@ first owns the key; the other gets `Cache already exists` and every restore
 afterwards hands out the first one's files.
 
 **never-on-default-branch** — every step that saves this cache is in a
-pull-request-only workflow. A run reads caches from its own ref, from the
-default branch, and from a pull request's base branch — never from a sibling —
-so nothing ever populates the branch the next pull request will read from.
+workflow that never runs on the default branch: pull-request-only, pushed
+only to some other branch, or tags-only. A run reads caches from its own ref,
+from the default branch, and from a pull request's base branch — never from a
+sibling — so nothing ever populates the branch the next pull request will
+read from. The finding names which of the three it found.
 
 **save-never-restored** — an `actions/cache/save` nothing reads, written every
 run against a 10 GB repository limit that evicts by least recent use.
@@ -191,6 +196,15 @@ guessing. What that leaves:
 - **`if:` is ignored.** A step that never runs is not reported as a cache that
   never hits, because deciding whether a condition can be true is a different
   tool's job.
+- **A default branch nothing on disk names.** `never-on-default-branch` is the
+  only check that needs a branch *name*, and the name is not in the workflow
+  files. It comes from `refs/remotes/origin/HEAD`, which `git clone` writes
+  and `actions/checkout` does not — checkout builds its checkout with `git
+  init` and a fetch, so it never asks the remote what HEAD is. With no name,
+  the half of the check that does not need one still runs (a
+  pull-request-only workflow populates no branch whatever it is called) and
+  the half that compares against a `branches:` filter says `not checked`.
+  Pass `--default-branch NAME` in CI, or anywhere the answer matters.
 
 ## Found in the wild
 
