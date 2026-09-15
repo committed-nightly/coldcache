@@ -385,6 +385,132 @@ class TestDefaultBranch:
         assert run(files, default_branch="trunk").findings != []
         assert run(files, default_branch="main").findings == []
 
+    def test_the_reason_names_the_trigger_it_actually_found(self, run):
+        # rust-analyzer's `metrics.yaml` is `push: branches: [master]` and has
+        # no `pull_request:` anywhere in it. Reporting it as pull-request-only
+        # sent a reader looking for a trigger that is not in the file.
+        files = {
+            "ci.yml": workflow(
+                job(cache("npm-v1")), triggers="on:\n  push:\n    branches: [master]"
+            )
+        }
+        message = only(run(files, default_branch="main")).message
+        assert "only runs on pushes to other branches" in message
+        assert "pull request" not in message.split(", so the cache")[0]
+
+    def test_a_tags_only_workflow_says_so(self, run):
+        files = {
+            "ci.yml": workflow(
+                job(cache("npm-v1")), triggers="on:\n  push:\n    tags: ['v*']"
+            )
+        }
+        assert "only runs for tag pushes" in only(run(files)).message
+
+    def test_two_reasons_are_both_named(self, run):
+        files = {
+            "ci.yml": workflow(
+                job(cache("npm-v1", action="actions/cache/restore")),
+                triggers="on: [pull_request]",
+            ),
+            "warm.yml": workflow(
+                job(cache("npm-v1", action="actions/cache/save")),
+                triggers="on:\n  pull_request:\n  push:\n    branches: [release]",
+                name="Warm",
+            ),
+        }
+        message = only(run(files, default_branch="main")).message
+        assert "only runs for pull requests and on pushes to other branches" in message
+
+
+class TestAnUnknownDefaultBranch:
+    """What the check can still say when nobody has named the branch.
+
+    Most of it, as it turns out. A pull-request-only workflow populates no
+    branch whatever the default one is called, so the check that catches the
+    common case needs no name at all. Only the comparisons that turn on the
+    name are declined -- and declining them is the fix, because guessing
+    `main` at that point invented a finding on two of the first three real
+    repositories this was run against.
+    """
+
+    def test_pull_request_only_is_still_a_finding(self, run):
+        report = run(
+            {"ci.yml": workflow(job(cache("npm-v1")), triggers="on: [pull_request]")},
+            default_branch=None,
+        )
+        assert only(report).kind == NEVER_ON_DEFAULT_BRANCH
+        assert report.undecided == []
+
+    def test_the_finding_does_not_invent_a_branch_name(self, run):
+        report = run(
+            {"ci.yml": workflow(job(cache("npm-v1")), triggers="on: [pull_request]")},
+            default_branch=None,
+        )
+        message = only(report).message
+        assert "never written on the default branch" in message
+        assert "main" not in message
+
+    def test_a_tags_only_push_is_still_a_finding(self, run):
+        report = run(
+            {
+                "ci.yml": workflow(
+                    job(cache("npm-v1")), triggers="on:\n  push:\n    tags: ['v*']"
+                )
+            },
+            default_branch=None,
+        )
+        assert only(report).kind == NEVER_ON_DEFAULT_BRANCH
+
+    def test_an_unfiltered_push_is_still_clean(self, run):
+        report = run({"ci.yml": workflow(job(cache("npm-v1")))}, default_branch=None)
+        assert report.findings == []
+        assert report.undecided == []
+
+    def test_a_named_branch_filter_is_declined_not_guessed(self, run):
+        # The rust-analyzer and next.js shape. With no name, `branches:
+        # [master]` could be the default branch or could not be, and the
+        # honest answer is the one the rest of this tool gives.
+        report = run(
+            {
+                "ci.yml": workflow(
+                    job(cache("npm-v1")),
+                    triggers="on:\n  push:\n    branches: [master]",
+                )
+            },
+            default_branch=None,
+        )
+        assert report.findings == []
+        assert len(report.undecided) == 1
+        assert "--default-branch" in report.undecided[0].reason
+
+    def test_a_wildcard_filter_needs_no_name(self, run):
+        report = run(
+            {
+                "ci.yml": workflow(
+                    job(cache("npm-v1")), triggers="on:\n  push:\n    branches: ['*']"
+                )
+            },
+            default_branch=None,
+        )
+        assert report.findings == []
+        assert report.undecided == []
+
+    def test_one_reachable_saver_settles_it_without_a_name(self, run):
+        files = {
+            "ci.yml": workflow(
+                job(cache("npm-v1", action="actions/cache/restore")),
+                triggers="on: [pull_request]",
+            ),
+            "warm.yml": workflow(
+                job(cache("npm-v1", action="actions/cache/save")),
+                triggers="on: [push]",
+                name="Warm",
+            ),
+        }
+        report = run(files, default_branch=None)
+        assert report.findings == []
+        assert report.undecided == []
+
 
 class TestReachesDefaultBranch:
     def test_no_triggers_is_not_a_finding(self):
@@ -434,6 +560,45 @@ class TestReachesDefaultBranch:
         assert (
             reaches_default_branch({"push": {"branches": ["mai?n"]}}, "main") is True
         )
+
+
+class TestReachesAnUnnamedDefaultBranch:
+    """`branch=None`: True, False and "ask me again with a name"."""
+
+    def test_pull_request_only_is_false_under_any_name(self):
+        assert reaches_default_branch({"pull_request": {}}, None) is False
+
+    def test_an_unfiltered_push_is_true_under_any_name(self):
+        assert reaches_default_branch({"push": {}}, None) is True
+
+    def test_a_named_filter_cannot_be_answered(self):
+        assert reaches_default_branch({"push": {"branches": ["master"]}}, None) is None
+
+    def test_a_wildcard_matches_whatever_the_name_is(self):
+        assert reaches_default_branch({"push": {"branches": ["*"]}}, None) is True
+
+    def test_a_tags_only_push_is_false_under_any_name(self):
+        assert reaches_default_branch({"push": {"tags": ["v*"]}}, None) is False
+
+    def test_branches_ignore_cannot_be_answered_either(self):
+        assert (
+            reaches_default_branch({"push": {"branches-ignore": ["docs"]}}, None)
+            is None
+        )
+
+    def test_an_unparseable_pattern_still_means_yes(self):
+        # Unparseable is assumed to match every name, which includes the one
+        # we do not know, so this stays True rather than becoming undecided.
+        assert (
+            reaches_default_branch({"push": {"branches": ["mai?n"]}}, None) is True
+        )
+
+    def test_a_schedule_needs_no_name(self):
+        assert reaches_default_branch({"schedule": [{"cron": "0 0 * * *"}]}, None)
+
+    def test_one_answerable_trigger_settles_the_whole_workflow(self):
+        triggers = {"push": {"branches": ["master"]}, "workflow_dispatch": {}}
+        assert reaches_default_branch(triggers, None) is True
 
 
 class TestQuiet:

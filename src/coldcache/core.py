@@ -17,9 +17,10 @@ years.
     key-collision              two steps share a key and cache different
                                directories; the first to run wins for ever
     save-never-restored        a cache written that nothing reads
-    never-on-default-branch    only pull requests ever save it, and a pull
-                               request cannot write to the branch the next
-                               pull request will read from
+    never-on-default-branch    every step that saves it is in a workflow
+                               that never runs on the default branch, so
+                               nothing populates the branch the next pull
+                               request will read from
 
 The last one is the one people do not believe until they check. Caches are
 scoped by ref: a run can read caches from its own ref, from the default
@@ -98,6 +99,21 @@ _CONTEXT = re.compile(
 #: Events that can only ever produce a run whose caches are scoped to a pull
 #: request, and so can never populate the default branch.
 PR_ONLY = ("pull_request", "pull_request_target")
+
+#: A branch filter's answer when the default branch's name would settle it
+#: and nobody has said what the name is. Not True and not False: a `branches:
+#: [master]` filter reaches the default branch on a repository whose default
+#: branch is `master` and misses it on one whose default branch is `main`,
+#: and the workflow file cannot tell you which you are looking at.
+UNNAMED = "unnamed-default-branch"
+
+#: Why a workflow never reaches the default branch, as sentence fragments
+#: that follow "only runs". Ordered so a workflow triggered several ways
+#: reads in a fixed order rather than dict order.
+PR_REASON = "for pull requests"
+TAG_REASON = "for tag pushes, whose caches are scoped to the tag's ref"
+BRANCH_REASON = "on pushes to other branches"
+REASON_ORDER = (PR_REASON, TAG_REASON, BRANCH_REASON)
 
 
 @dataclass
@@ -293,7 +309,7 @@ def _patterns(source: str) -> list[str] | None:
     ]
 
 
-def _branch_matches(pattern: str, branch: str) -> bool | None:
+def _branch_matches(pattern: str, branch: str | None) -> bool | str | None:
     """Whether a `branches:` filter names the default branch.
 
     Deliberately narrow. GitHub's filter syntax is its own dialect -- `?` and
@@ -301,7 +317,18 @@ def _branch_matches(pattern: str, branch: str) -> bool | None:
     getting it exactly right is a different tool's job. Anything beyond a
     plain name or a leading/trailing `*` comes back None, which the caller
     reads as "assume it can run" and so never produces a finding.
+
+    `branch` is None when nobody has said what the default branch is called.
+    Some patterns are still answerable: `*` matches whatever the name turns
+    out to be, and an unparseable pattern is assumed to match it for the same
+    reason it is assumed to match a known one. Everything else is UNNAMED.
     """
+    if branch is None:
+        if pattern in ("*", "**"):
+            return True
+        if any(ch in pattern for ch in "?+[]!"):
+            return None
+        return UNNAMED
     if pattern == branch:
         return True
     if pattern in ("*", "**"):
@@ -318,15 +345,55 @@ def _branch_matches(pattern: str, branch: str) -> bool | None:
     return None
 
 
-def reaches_default_branch(triggers: dict[str, Any], branch: str) -> bool:
+def _push_reaches(config: dict[str, Any], branch: str | None) -> bool | str:
+    """Whether one `push:` trigger can produce a run on the default branch."""
+    allowed = config.get("branches")
+    denied = config.get("branches-ignore")
+    if allowed is None and denied is None:
+        if "tags" in config or "tags-ignore" in config:
+            # A tag push is scoped to the tag's ref, not to the branch it
+            # happens to point at.
+            return False
+        return True
+    if isinstance(denied, list):
+        answers = [_branch_matches(str(p), branch) for p in denied]
+        if any(a is None for a in answers):
+            return True
+        if UNNAMED in answers:
+            return UNNAMED
+        if not any(answers):
+            return True
+        return False
+    if isinstance(allowed, list):
+        answers = [_branch_matches(str(p), branch) for p in allowed]
+        # `a is True` rather than `a`, because UNNAMED is a truthy string and
+        # reading it as a match is how this check would get its confidence
+        # back by the back door.
+        if any(a is None or a is True for a in answers):
+            return True
+        if UNNAMED in answers:
+            return UNNAMED
+        return False
+    return True
+
+
+def reaches_default_branch(
+    triggers: dict[str, Any], branch: str | None
+) -> bool | None:
     """Whether a workflow can produce a run whose caches land on `branch`.
 
-    True when the answer is yes or cannot be decided. Only a workflow that is
-    certainly pull-request-only, or certainly filtered away from the default
-    branch, comes back False.
+    True when the answer is yes or cannot be decided from the filter syntax.
+    False when the workflow certainly never runs there. None when the answer
+    turns on the default branch's *name* and `branch` is None because nobody
+    said what it is -- reported as `not checked`, never as a finding.
+
+    False survives an unknown name, which is most of the check: a
+    pull-request-only workflow populates no branch whatever the default one
+    is called, and neither does a tags-only push.
     """
     if not triggers:
         return True
+    unnamed = False
     for event, config in triggers.items():
         if event in PR_ONLY:
             continue
@@ -335,38 +402,25 @@ def reaches_default_branch(triggers: dict[str, Any], branch: str) -> bool:
             # rest all run on a branch you chose, and the default branch is
             # the one you get if you choose nothing.
             return True
-        config = config if isinstance(config, dict) else {}
-        allowed = config.get("branches")
-        denied = config.get("branches-ignore")
-        if allowed is None and denied is None:
-            if "tags" in config or "tags-ignore" in config:
-                # A tag push is scoped to the tag's ref, not to the branch
-                # it happens to point at.
-                continue
+        answer = _push_reaches(config if isinstance(config, dict) else {}, branch)
+        if answer is True:
             return True
-        if isinstance(denied, list):
-            answers = [_branch_matches(str(p), branch) for p in denied]
-            if any(a is None for a in answers):
-                return True
-            if not any(answers):
-                return True
-            continue
-        if isinstance(allowed, list):
-            answers = [_branch_matches(str(p), branch) for p in allowed]
-            if any(a is None or a for a in answers):
-                return True
-            continue
-        return True
-    return False
+        if answer == UNNAMED:
+            unnamed = True
+    return None if unnamed else False
 
 
 def scan(
     files: dict[str, str],
     tree: Tree | None = None,
-    default_branch: str = "main",
+    default_branch: str | None = None,
     extra_actions: tuple[str, ...] = (),
 ) -> Report:
-    """Check a whole repository: {repo-relative path: workflow text}."""
+    """Check a whole repository: {repo-relative path: workflow text}.
+
+    `default_branch` None means nobody knows the name, not that it is `main`.
+    See `_check_default_branch` for what that costs.
+    """
     steps: list[CacheStep] = []
     for path, text in sorted(files.items()):
         _, found = load(text, path, extra_actions)
@@ -379,7 +433,7 @@ def scan(
 def check(
     steps: list[CacheStep],
     tree: Tree | None = None,
-    default_branch: str = "main",
+    default_branch: str | None = None,
 ) -> Report:
     """Run every check over every cache step in a repository."""
     report = Report(steps=len(steps))
@@ -583,14 +637,54 @@ def _check_collisions(caches: list[Cache], report: Report) -> None:
             )
 
 
+def _reasons(triggers: dict[str, Any], branch: str | None) -> set[str]:
+    """Why this workflow never reaches the default branch.
+
+    Only meaningful for triggers `reaches_default_branch` already called
+    False, which is why every branch here describes a way of not getting
+    there. Reporting "only runs for pull requests" for a workflow that is in
+    fact a `push:` to another branch was half of the original bug: the
+    finding was right about rust-analyzer being unreachable and wrong about
+    the reason, so anyone chasing it went looking for a `pull_request:` that
+    was not in the file.
+    """
+    found: set[str] = set()
+    for event, config in triggers.items():
+        if event in PR_ONLY:
+            found.add(PR_REASON)
+            continue
+        if event != "push":
+            continue
+        config = config if isinstance(config, dict) else {}
+        if "branches" in config or "branches-ignore" in config:
+            found.add(BRANCH_REASON)
+        elif "tags" in config or "tags-ignore" in config:
+            found.add(TAG_REASON)
+    return found
+
+
+def _phrase(reasons: set[str]) -> str:
+    ordered = [r for r in REASON_ORDER if r in reasons]
+    if not ordered:  # pragma: no cover - a workflow with no triggers reaches
+        return "never runs on it"
+    return "only runs " + " and ".join(ordered)
+
+
 def _check_default_branch(
-    savers: list[Cache], restorers: list[Cache], report: Report, branch: str
+    savers: list[Cache], restorers: list[Cache], report: Report, branch: str | None
 ) -> None:
-    """Caches that only pull requests ever write.
+    """Caches that nothing ever writes on the default branch.
 
     A pull request run cannot write a cache the next pull request can read:
     its caches are scoped to that pull request's ref. So if nothing saves on
     the default branch, every pull request starts cold and stays that way.
+    The same is true of a workflow pushed only to some other branch, and of
+    one that only runs for tags.
+
+    `branch` is None when nobody named the default branch and none could be
+    read off disk. That does not stop the check -- a pull-request-only
+    workflow reaches no branch under any name -- but the cases that turn on
+    the name are declined rather than guessed at.
     """
     if not savers:
         return
@@ -598,9 +692,30 @@ def _check_default_branch(
         writers = [s for s in savers if _serves(restorer, s) == MATCH]
         if not writers:
             continue
-        if any(reaches_default_branch(w.step.triggers, branch) for w in writers):
+        answers = [reaches_default_branch(w.step.triggers, branch) for w in writers]
+        if any(a is True for a in answers):
             continue
         where = ", ".join(sorted({w.step.path for w in writers}))
+        if any(a is None for a in answers):
+            report.undecided.append(
+                Undecided(
+                    path=restorer.step.path,
+                    where=restorer.step.label,
+                    reason=(
+                        f"whether anything saves this cache on the default "
+                        f"branch depends on what that branch is called, and "
+                        f"nothing says: the saving workflow ({where}) has a "
+                        "push filter naming specific branches, and there is no "
+                        "refs/remotes/origin/HEAD here to read the name from. "
+                        "Pass --default-branch NAME to check it."
+                    ),
+                )
+            )
+            continue
+        named = branch or "the default branch"
+        reasons: set[str] = set()
+        for writer in writers:
+            reasons |= _reasons(writer.step.triggers, branch)
         report.findings.append(
             Finding(
                 kind=NEVER_ON_DEFAULT_BRANCH,
@@ -610,8 +725,8 @@ def _check_default_branch(
                 other=where,
                 message=(
                     f"every step that saves this cache ({where}) is in a "
-                    "workflow that only runs for pull requests, so the cache is "
-                    f"never written on {branch}. A run can read caches from its "
+                    f"workflow that {_phrase(reasons)}, so the cache is "
+                    f"never written on {named}. A run can read caches from its "
                     "own ref, from the default branch and from a pull request's "
                     "base branch -- never from a sibling -- so every new pull "
                     "request starts cold, and only a second push to that same "
