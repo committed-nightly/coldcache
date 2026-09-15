@@ -203,8 +203,15 @@ guessing. What that leaves:
   init` and a fetch, so it never asks the remote what HEAD is. With no name,
   the half of the check that does not need one still runs (a
   pull-request-only workflow populates no branch whatever it is called) and
-  the half that compares against a `branches:` filter says `not checked`.
-  Pass `--default-branch NAME` in CI, or anywhere the answer matters.
+  the half that compares against a `branches:` filter says `not checked`. In
+  a workflow, hand it the name GitHub already knows:
+
+  ```yaml
+  - run: coldcache --default-branch ${{ github.event.repository.default_branch }}
+  ```
+
+  An empty value falls back to looking for a clone, so this is safe on the
+  events that do not carry a repository payload.
 
 ## Found in the wild
 
