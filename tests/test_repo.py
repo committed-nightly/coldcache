@@ -7,7 +7,9 @@ turning into `main`.
 
 from __future__ import annotations
 
-from coldcache.repo import default_branch, git_dir
+import json
+
+from coldcache.repo import actions_default_branch, default_branch, discover, git_dir
 
 
 def clone(tmp_path, remote="origin", head="ref: refs/remotes/origin/main"):
@@ -17,6 +19,29 @@ def clone(tmp_path, remote="origin", head="ref: refs/remotes/origin/main"):
     if head is not None:
         (refs / "HEAD").write_text(head + "\n")
     return str(tmp_path)
+
+
+#: What a real `push` payload carries, cut down to the one key read here.
+PAYLOAD = {"repository": {"full_name": "o/r", "default_branch": "master"}}
+
+
+def actions(tmp_path, workspace, payload=PAYLOAD):
+    """The environment of a run, with whatever event payload you ask for.
+
+    `payload` as a string is written out as-is, for the cases where it is not
+    JSON at all. None writes no file, which is what a `$GITHUB_EVENT_PATH`
+    pointing at nothing looks like.
+    """
+    event = tmp_path / "event.json"
+    if isinstance(payload, str):
+        event.write_text(payload)
+    elif payload is not None:
+        event.write_text(json.dumps(payload))
+    return {
+        "GITHUB_ACTIONS": "true",
+        "GITHUB_WORKSPACE": str(workspace),
+        "GITHUB_EVENT_PATH": str(event),
+    }
 
 
 class TestDefaultBranch:
@@ -124,3 +149,129 @@ class TestGitDir:
         tree.mkdir()
         (tree / ".git").write_text("gitdir:\n")
         assert git_dir(str(tree)) is None
+
+
+class TestActionsPayload:
+    def test_the_workspace_gets_the_name_from_the_event(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        env = actions(tmp_path, work)
+        assert actions_default_branch(str(work), env) == "master"
+
+    def test_outside_actions_nothing_is_read(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        env = actions(tmp_path, work) | {"GITHUB_ACTIONS": ""}
+        assert actions_default_branch(str(work), env) is None
+        assert actions_default_branch(str(work), {}) is None
+
+    def test_another_repository_in_the_workspace_is_not_the_workspace(self, tmp_path):
+        # The one this guard exists for. A workflow that clones
+        # rust-analyzer into its own workspace and checks that must not be
+        # handed its own repository's default branch -- `main` about a
+        # repository on `master` is the exact false positive the git read
+        # was changed to stop producing.
+        work = tmp_path / "work"
+        (work / "rust-analyzer").mkdir(parents=True)
+        env = actions(tmp_path, work)
+        assert actions_default_branch(str(work / "rust-analyzer"), env) is None
+
+    def test_a_checkout_placed_with_path_is_declined(self, tmp_path):
+        # `actions/checkout` with `path: src` is a real checkout of the
+        # repository the payload is about, and this still says no, because
+        # nothing here can tell it apart from the case above. Documented, and
+        # --default-branch covers it.
+        work = tmp_path / "work"
+        (work / "src").mkdir(parents=True)
+        env = actions(tmp_path, work)
+        assert actions_default_branch(str(work / "src"), env) is None
+
+    def test_the_parent_of_the_workspace_is_not_the_workspace(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        env = actions(tmp_path, work)
+        assert actions_default_branch(str(tmp_path), env) is None
+
+    def test_a_symlinked_workspace_is_still_itself(self, tmp_path):
+        # How a container job usually sees it.
+        work = tmp_path / "work"
+        work.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(work)
+        env = actions(tmp_path, work)
+        assert actions_default_branch(str(link), env) == "master"
+
+    def test_no_event_path_at_all(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        env = actions(tmp_path, work) | {"GITHUB_EVENT_PATH": ""}
+        assert actions_default_branch(str(work), env) is None
+
+    def test_no_workspace_at_all(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        env = actions(tmp_path, work) | {"GITHUB_WORKSPACE": ""}
+        assert actions_default_branch(str(work), env) is None
+
+    def test_an_event_file_that_is_not_there(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        env = actions(tmp_path, work, payload=None)
+        assert actions_default_branch(str(work), env) is None
+
+    def test_an_event_file_that_is_not_json(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        env = actions(tmp_path, work, payload="{not json at all")
+        assert actions_default_branch(str(work), env) is None
+
+    def test_a_payload_that_is_not_an_object(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        env = actions(tmp_path, work, payload="[1, 2, 3]")
+        assert actions_default_branch(str(work), env) is None
+
+    def test_a_payload_with_no_repository(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        env = actions(tmp_path, work, payload={"action": "opened"})
+        assert actions_default_branch(str(work), env) is None
+
+    def test_a_repository_that_is_not_an_object(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        env = actions(tmp_path, work, payload={"repository": "o/r"})
+        assert actions_default_branch(str(work), env) is None
+
+    def test_a_default_branch_that_is_not_a_name(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        for value in ("", "   ", None, 4, ["main"]):
+            env = actions(tmp_path, work, payload={"repository": {"default_branch": value}})
+            assert actions_default_branch(str(work), env) is None
+
+
+class TestDiscover:
+    def test_git_answers_and_says_so(self, tmp_path):
+        root = clone(tmp_path, head="ref: refs/remotes/origin/canary")
+        assert discover(root, {}) == ("canary", "git")
+
+    def test_the_payload_answers_when_git_cannot(self, tmp_path):
+        # The `actions/checkout` case end to end: origin/HEAD is there and
+        # holds a sha, so git has nothing, and the payload does.
+        work = tmp_path / "work"
+        work.mkdir()
+        clone(work, head="9c2a8fd1ad2ba1cbb43df2b0dfa1ba0b7d6e5a41")
+        assert discover(str(work), actions(tmp_path, work)) == ("master", "actions")
+
+    def test_git_goes_first_when_both_answer(self, tmp_path):
+        # A real clone inside a run. The tree in front of you beats the
+        # repository the run belongs to; they are the same thing here, and
+        # when they are not, the tree is the one being checked.
+        work = tmp_path / "work"
+        work.mkdir()
+        clone(work, head="ref: refs/remotes/origin/trunk")
+        assert discover(str(work), actions(tmp_path, work)) == ("trunk", "git")
+
+    def test_neither_answers(self, tmp_path):
+        assert discover(str(tmp_path), {}) == (None, "nowhere")
