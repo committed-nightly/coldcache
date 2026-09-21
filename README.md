@@ -29,15 +29,18 @@ coldcache
 ```
 
 It reads `.github/workflows` off disk, and the rest of the working tree too,
-because `hashFiles()` is a question about which files exist. The one thing it
-reads outside the tree is `.git/refs/remotes/origin/HEAD`, which is where a
-clone records the remote's default branch — a file, not a `git` subprocess.
-No network, no token, no Actions API.
+because `hashFiles()` is a question about which files exist. Two things it
+reads outside the tree, both files and neither a `git` subprocess or an API
+call: `.git/refs/remotes/origin/HEAD`, which is where a clone records the
+remote's default branch, and — when it is running inside a GitHub Actions
+job, against that job's own workspace — the event payload at
+`$GITHUB_EVENT_PATH`, which carries the same name. No network, no token.
 
 ```
 --default-branch NAME   the branch a cache must be saved on for other
                         branches to read it. Default: whatever the clone
-                        recorded, and nothing assumed if it recorded nothing
+                        recorded, then what the run's event payload says,
+                        and nothing assumed if neither said anything
 --also OWNER/REPO       another action taking the same key, restore-keys and
                         path inputs, such as buildjet/cache. Repeatable
 --json                  the same findings, for piping somewhere
@@ -200,18 +203,35 @@ guessing. What that leaves:
   only check that needs a branch *name*, and the name is not in the workflow
   files. It comes from `refs/remotes/origin/HEAD`, which `git clone` writes
   and `actions/checkout` does not — checkout builds its checkout with `git
-  init` and a fetch, so it never asks the remote what HEAD is. With no name,
-  the half of the check that does not need one still runs (a
-  pull-request-only workflow populates no branch whatever it is called) and
-  the half that compares against a `branches:` filter says `not checked`. In
-  a workflow, hand it the name GitHub already knows:
+  init` and a fetch, so it never asks the remote what HEAD is. Inside a run
+  the name is then read from the event payload instead, so the plain
+
+  ```yaml
+  - uses: actions/checkout@v4
+  - run: coldcache
+  ```
+
+  gets a name without being told one. That second source applies only when
+  the directory being checked *is* `$GITHUB_WORKSPACE`. Point it at a
+  repository you cloned into the workspace yourself, or at a checkout placed
+  elsewhere with `path:`, and it goes back to having no name rather than
+  telling you your own repository's default branch about somebody else's
+  code. Pass `--default-branch NAME` there — or, if you would rather be
+  explicit everywhere:
 
   ```yaml
   - run: coldcache --default-branch ${{ github.event.repository.default_branch }}
   ```
 
-  An empty value falls back to looking for a clone, so this is safe on the
-  events that do not carry a repository payload.
+  An empty value falls back to the other two sources, so that stays safe on
+  the events with no repository payload.
+
+  With no name from anywhere, the half of the check that does not need one
+  still runs — a pull-request-only workflow populates no branch whatever it
+  is called — and the half that compares against a `branches:` filter says
+  `not checked`. `--json` reports `default_branch_source` as one of `flag`,
+  `git`, `actions` or `nowhere`, so which of these happened is answerable
+  without guessing.
 
 ## Found in the wild
 
