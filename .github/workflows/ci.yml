@@ -115,8 +115,35 @@ jobs:
           # What actions/checkout leaves behind: a sha, not a name. Unknown,
           # so the check declines rather than falling back to `main` -- and
           # says so, which is the half worth asserting.
+          #
+          # This also pins the guard on the event-payload source. This step
+          # runs inside a run whose payload says `main`, and /tmp/onmaster is
+          # not the workspace, so the payload must not be read for it. If it
+          # ever is, `main` against `branches: [master]` is a finding and
+          # this goes red.
           echo '0000000000000000000000000000000000000000' > $HEAD
           code=0; coldcache /tmp/onmaster > /tmp/unknown.txt || code=$?
           test "$code" -eq 0 || { echo "no name: expected 0, got $code"; exit 1; }
           grep -q '^not checked:' /tmp/unknown.txt \
             || { cat /tmp/unknown.txt; echo "declined silently"; exit 1; }
+
+      - name: inside a run, the workspace gets its name from the event payload
+        # The other side of it, on this repository, for real. checkout leaves
+        # origin/HEAD holding a sha, so there is no name in this clone -- if
+        # coldcache reports one, $GITHUB_EVENT_PATH is the only place it can
+        # have come from. This repository's default branch is `main`.
+        run: |
+          if git symbolic-ref -q refs/remotes/origin/HEAD; then
+            echo "this checkout records a branch name, so the assertion below proves nothing"
+            exit 1
+          fi
+          coldcache --json > /tmp/self.json
+          python - /tmp/self.json <<'PY'
+          import json, sys
+
+          want = {"default_branch": "main", "default_branch_source": "actions"}
+          got = json.load(open(sys.argv[1]))
+          have = {key: got.get(key) for key in want}
+          if have != want:
+              raise SystemExit(f"expected {want}, got {have}")
+          PY

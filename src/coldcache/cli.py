@@ -25,7 +25,7 @@ import textwrap
 
 from .core import Report, scan
 from .globs import Tree
-from .repo import default_branch
+from .repo import FLAG, discover
 from .workflows import WORKFLOW_DIR, WORKFLOW_SUFFIXES, WorkflowError, is_workflow_path
 
 EXIT_OK = 0
@@ -54,9 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help=(
             "the branch a cache has to be saved on for every other branch to "
-            "read it. Default: whatever refs/remotes/origin/HEAD says. If that "
-            "is not there, nothing is assumed -- the one check that needs the "
-            "name declines the cases that turn on it"
+            "read it. Default: whatever refs/remotes/origin/HEAD says, and "
+            "failing that the GitHub Actions event payload when this is the "
+            "workspace of a run. If neither says, nothing is assumed -- the "
+            "one check that needs the name declines the cases that turn on it"
         ),
     )
     parser.add_argument(
@@ -176,10 +177,13 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ERROR
 
     # An explicit --default-branch is taken at its word. Otherwise ask git,
-    # and if git has not been asked either, carry on without a name rather
-    # than assuming `main`: two of the first three real repositories this was
-    # pointed at were on `master` and `canary`.
-    branch = args.default_branch or default_branch(args.path)
+    # then the Actions event payload, and if neither answers, carry on
+    # without a name rather than assuming `main`: two of the first three real
+    # repositories this was pointed at were on `master` and `canary`.
+    if args.default_branch:
+        branch, source = args.default_branch, FLAG
+    else:
+        branch, source = discover(args.path)
 
     try:
         report = scan(
@@ -202,6 +206,10 @@ def main(argv: list[str] | None = None) -> int:
                     # Anything consuming this needs to be able to tell a
                     # clean never-on-default-branch from an unasked one.
                     "default_branch": branch,
+                    # And which of flag/git/actions/nowhere said so, because
+                    # a name that arrived from somewhere you did not expect
+                    # is worth being able to see without guessing.
+                    "default_branch_source": source,
                     "findings": [f.as_dict() for f in report.sorted_findings()],
                     "undecided": [
                         {"path": u.path, "where": u.where, "reason": u.reason}

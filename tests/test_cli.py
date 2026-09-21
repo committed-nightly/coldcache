@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 
@@ -56,6 +57,33 @@ def repo(tmp_path):
             refs.mkdir(parents=True)
             (refs / "HEAD").write_text(f"ref: refs/remotes/origin/{cloned_from}\n")
         return str(tmp_path)
+
+    return go
+
+
+def checked_out(root):
+    """What `actions/checkout` leaves behind, over whatever was there.
+
+    It builds its checkout with `git init` and a fetch rather than a clone,
+    so `refs/remotes/origin/HEAD` exists and holds a sha instead of a name.
+    """
+    refs = pathlib.Path(root) / ".git" / "refs" / "remotes" / "origin"
+    refs.mkdir(parents=True, exist_ok=True)
+    (refs / "HEAD").write_text("9c2a8fd1ad2ba1cbb43df2b0dfa1ba0b7d6e5a41\n")
+
+
+@pytest.fixture
+def in_actions(monkeypatch, tmp_path_factory):
+    """Put the process inside a run whose workspace is `root`."""
+
+    def go(root, default_branch="master"):
+        event = tmp_path_factory.mktemp("event") / "event.json"
+        event.write_text(
+            json.dumps({"repository": {"default_branch": default_branch}})
+        )
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.setenv("GITHUB_WORKSPACE", root)
+        monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
 
     return go
 
@@ -192,6 +220,80 @@ def test_json_says_so_when_it_had_none(repo, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["default_branch"] is None
     assert len(payload["undecided"]) == 1
+
+
+def test_a_checkout_in_a_run_reads_the_event_payload(repo, in_actions, capsys):
+    # The whole point of the change. Under `actions/checkout` there is no
+    # name in the clone, so every run of this in somebody's own CI used to
+    # print `not checked` for the one check that needs it.
+    root = repo({"ci.yml": ON_MASTER})
+    checked_out(root)
+    in_actions(root, default_branch="master")
+    assert main([root]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "not checked:" not in out
+    assert "never-on-default-branch" not in out
+
+
+def test_the_payload_can_also_produce_the_finding(repo, in_actions, capsys):
+    # And it is a name, not a way of going quiet: a repository whose real
+    # default branch is `main`, saving only on `master`, is a finding.
+    root = repo({"ci.yml": ON_MASTER})
+    checked_out(root)
+    in_actions(root, default_branch="main")
+    assert main([root]) == EXIT_FOUND
+    assert "never-on-default-branch" in capsys.readouterr().out
+
+
+def test_a_clone_beats_the_payload(repo, in_actions, capsys):
+    root = repo({"ci.yml": ON_MASTER}, cloned_from="master")
+    in_actions(root, default_branch="main")
+    main([root, "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert (payload["default_branch"], payload["default_branch_source"]) == (
+        "master",
+        "git",
+    )
+
+
+def test_the_flag_beats_the_payload(repo, in_actions, capsys):
+    root = repo({"ci.yml": ON_MASTER})
+    checked_out(root)
+    in_actions(root, default_branch="master")
+    main([root, "--default-branch", "main", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert (payload["default_branch"], payload["default_branch_source"]) == (
+        "main",
+        "flag",
+    )
+
+
+def test_a_repository_that_is_not_the_workspace_is_left_alone(
+    repo, in_actions, tmp_path_factory, capsys
+):
+    # A run that clones somebody else's repository and checks that. The
+    # payload is about the workspace, not about this, so it declines --
+    # which is the whole reason the previous check was changed to read
+    # origin/HEAD rather than assume `main`.
+    root = repo({"ci.yml": ON_MASTER})
+    checked_out(root)
+    in_actions(str(tmp_path_factory.mktemp("workspace")), default_branch="main")
+    assert main([root]) == EXIT_OK
+    assert "not checked:" in capsys.readouterr().out
+
+
+def test_json_names_the_source_when_there_was_none(repo, capsys):
+    root = repo({"ci.yml": ON_MASTER})
+    main([root, "--json"])
+    assert json.loads(capsys.readouterr().out)["default_branch_source"] == "nowhere"
+
+
+def test_json_names_the_payload_as_the_source(repo, in_actions, capsys):
+    root = repo({"ci.yml": ON_MASTER})
+    checked_out(root)
+    in_actions(root, default_branch="master")
+    main([root, "--json"])
+    assert json.loads(capsys.readouterr().out)["default_branch_source"] == "actions"
 
 
 def test_also_registers_a_drop_in_action(repo):

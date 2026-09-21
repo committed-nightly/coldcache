@@ -705,9 +705,11 @@ def _check_default_branch(
                         f"whether anything saves this cache on the default "
                         f"branch depends on what that branch is called, and "
                         f"nothing says: the saving workflow ({where}) has a "
-                        "push filter naming specific branches, and there is no "
-                        "refs/remotes/origin/HEAD here to read the name from. "
-                        "Pass --default-branch NAME to check it."
+                        "push filter naming specific branches, and nothing "
+                        "here names the branch -- no symbolic "
+                        "refs/remotes/origin/HEAD, and no GitHub Actions "
+                        "event payload describing this tree. Pass "
+                        "--default-branch NAME to check it."
                     ),
                 )
             )

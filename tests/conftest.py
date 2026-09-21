@@ -12,6 +12,19 @@ def dedent(text: str) -> str:
     return textwrap.dedent(text).lstrip("\n")
 
 
+@pytest.fixture(autouse=True)
+def outside_actions(monkeypatch):
+    """Nothing reads the real run's environment.
+
+    This suite runs in GitHub Actions, where `GITHUB_WORKSPACE` and an event
+    payload are both set and describe the coldcache repository. No test wants
+    that, and a test that accidentally got it would pass here and nowhere
+    else.
+    """
+    for name in ("GITHUB_ACTIONS", "GITHUB_WORKSPACE", "GITHUB_EVENT_PATH"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def run():
     """Check a set of workflows and hand back the report.

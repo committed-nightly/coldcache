@@ -33,11 +33,28 @@ Not there is a real case, and the common one: `actions/checkout` builds its
 checkout with `git init` and a fetch rather than a clone, so it never asks
 the remote about HEAD. It leaves `refs/remotes/origin/HEAD` holding a plain
 sha, which is not a name and is read here as "unknown".
+
+Which made `not checked` the normal result for anyone who wired this into
+their own CI -- the one place it is most likely to run. So there is a second
+source for that case only: inside GitHub Actions the event payload at
+`$GITHUB_EVENT_PATH` carries `repository.default_branch`, which is GitHub's
+own answer, already on disk, and needs no token either.
+
+It is read under one condition: the tree being checked has to be
+`$GITHUB_WORKSPACE` itself. The payload describes the repository the *run*
+belongs to, and a workflow that clones somebody else's repository into the
+workspace and points this at it would otherwise be told its own default
+branch about a repository that has never heard of it -- which is the same
+confident wrong answer as assuming `main`, arrived at more expensively. A
+checkout placed somewhere else with `path:` is a real repository this
+declines to name; `--default-branch` still covers it.
 """
 
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import Mapping
 
 #: The symbolic ref a clone writes, relative to the git directory.
 HEAD_REF = "HEAD"
@@ -48,6 +65,22 @@ REMOTES = "refs/remotes"
 PREFERRED = "origin"
 
 _SYMREF = "ref: "
+
+#: Set to the string `true` by GitHub Actions, and by nothing else that has
+#: an event payload worth reading.
+ACTIONS = "GITHUB_ACTIONS"
+
+#: The JSON payload for the event that started the run.
+EVENT_PATH = "GITHUB_EVENT_PATH"
+
+#: Where `actions/checkout` puts the repository the run belongs to.
+WORKSPACE = "GITHUB_WORKSPACE"
+
+#: Where a name came from, for anything that wants to say so.
+FLAG = "flag"
+GIT = "git"
+ACTIONS_EVENT = "actions"
+NOWHERE = "nowhere"
 
 
 def git_dir(root: str) -> str | None:
@@ -133,3 +166,69 @@ def default_branch(root: str) -> str | None:
     if len(set(answers.values())) == 1:
         return next(iter(answers.values()))
     return None
+
+
+def _same_tree(root: str, workspace: str) -> bool:
+    """Whether `root` and `workspace` are the same directory.
+
+    By real path, so that a symlinked workspace -- which is how a container
+    job usually sees it -- still counts as itself.
+    """
+    try:
+        return os.path.realpath(root) == os.path.realpath(workspace)
+    except OSError:  # pragma: no cover - realpath does not raise on Linux
+        return False
+
+
+def actions_default_branch(
+    root: str, env: Mapping[str, str] | None = None
+) -> str | None:
+    """The default branch from the Actions event payload, if it applies here.
+
+    None for every reason there is: not in Actions, no payload, a payload
+    that is not about a repository, and -- the one worth having -- a payload
+    about a different repository than the one being checked. Every one of
+    those is "nobody said", which is what the caller does with it.
+    """
+    env = os.environ if env is None else env
+    if env.get(ACTIONS) != "true":
+        return None
+    workspace = env.get(WORKSPACE)
+    event = env.get(EVENT_PATH)
+    if not workspace or not event or not _same_tree(root, workspace):
+        return None
+    try:
+        with open(event, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    repository = payload.get("repository")
+    if not isinstance(repository, dict):
+        # `schedule`, `push` and the rest all carry one, but a payload is
+        # whatever GitHub sent and this is not worth a stack trace.
+        return None
+    name = repository.get("default_branch")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    return name
+
+
+def discover(root: str, env: Mapping[str, str] | None = None) -> tuple[str | None, str]:
+    """The default branch for `root`, and which of the sources said so.
+
+    git first. It is the answer for the tree in front of you rather than for
+    whatever repository a run happens to belong to, it is the only source
+    outside Actions, and reordering these would change what this tool says
+    on a machine where it already works. The one case it costs: a repository
+    whose default branch was renamed after the clone, where `origin/HEAD` is
+    stale and the payload would have been right.
+    """
+    found = default_branch(root)
+    if found is not None:
+        return found, GIT
+    found = actions_default_branch(root, env)
+    if found is not None:
+        return found, ACTIONS_EVENT
+    return None, NOWHERE
